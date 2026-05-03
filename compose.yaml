@@ -1,0 +1,33 @@
+services:
+  stonk-tracker:
+    build:
+      context: .
+    image: stonk-tracker-agent:local
+    ports:
+      - "8501:8501"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      SQLITE_DATABASE_URL: ${SQLITE_DATABASE_URL:-sqlite:////data/stonk_tracker_local.db}
+      DB_SERVER: ${DB_SERVER:-}
+      DB_PORT: ${DB_PORT:-1433}
+      DB_NAME: ${DB_NAME:-}
+      DB_USER: ${DB_USER:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_DRIVER: ${DB_DRIVER:-ODBC Driver 18 for SQL Server}
+      DB_TRUST_SERVER_CERTIFICATE: ${DB_TRUST_SERVER_CERTIFICATE:-true}
+      DB_ENCRYPT: ${DB_ENCRYPT:-true}
+      REPORTS_DIR: ${REPORTS_DIR:-/app/reports}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-nano}
+      ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Madrid}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+    volumes:
+      - stonk-data:/data
+      - stonk-reports:/app/reports
+    restart: unless-stopped
+
+volumes:
+  stonk-data:
+  stonk-reports:
