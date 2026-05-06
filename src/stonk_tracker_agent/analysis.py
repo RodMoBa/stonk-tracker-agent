@@ -53,6 +53,83 @@ def diversification_notes(stocks: list[Any]) -> list[str]:
     return notes
 
 
+def diversification_research_ideas(stocks: list[Any]) -> list[dict[str, str]]:
+    sectors = {(_field(stock, "sector") or "Unknown").lower() for stock in stocks}
+    regions = {(_field(stock, "country_region") or "Unknown").lower() for stock in stocks}
+    ideas = [
+        {"area": "Defensive sectors", "examples": "Utilities, consumer staples, telecom", "why": "Compare against growth-heavy or catalyst-dependent exposure."},
+        {"area": "Healthcare", "examples": "Large-cap pharmaceuticals, medical devices, healthcare services", "why": "Research whether earnings drivers differ from technology and AI narratives."},
+        {"area": "Industrials and infrastructure", "examples": "Railroads, automation, electrical equipment, infrastructure services", "why": "Investigate exposure tied to capital spending, reshoring, and infrastructure demand."},
+        {"area": "Cash-flow and dividend-focused businesses", "examples": "Mature cash-generative companies; dividend-focused screens", "why": "Compare durability of cash flows against high-growth valuation sensitivity."},
+        {"area": "Broad market or factor ETFs", "examples": "Broad index, value, quality, low-volatility, equal-weight screens", "why": "Benchmark concentration risk and single-company risk against diversified baskets."},
+        {"area": "Fixed income or cash-like instruments", "examples": "Treasury bills, investment-grade bond funds, money-market style instruments", "why": "Research ballast, liquidity, and interest-rate sensitivity outside equities."},
+        {"area": "International exposure", "examples": "Developed ex-US, Europe, Japan, emerging-market screens", "why": "Compare geographic, currency, valuation, and macro-cycle differences."},
+        {"area": "Commodities and real assets", "examples": "Energy, metals, commodity producers, real-asset infrastructure", "why": "Investigate inflation, supply-chain, and commodity-cycle sensitivity."},
+    ]
+    if "technology" in sectors or "communication services" in sectors:
+        ideas.insert(0, {"area": "Non-tech cash-flow businesses", "examples": "Insurance, logistics, consumer staples, selected financials", "why": "Stress-test whether the watchlist depends too heavily on AI/software/growth narratives."})
+    if len(regions) <= 1:
+        ideas.insert(0, {"area": "Non-domestic market exposure", "examples": "Europe, Japan, developed ex-US, selective emerging-market screens", "why": "Research whether currency and regional macro exposure are concentrated."})
+    return ideas
+
+
+def candidate_watchlist_research_ideas(stocks: list[Any]) -> list[dict[str, str]]:
+    sectors = {(_field(stock, "sector") or "").lower() for stock in stocks}
+    ideas = [
+        {
+            "ticker": "XLU",
+            "name": "Utilities Select Sector SPDR ETF",
+            "angle": "A utilities basket can be useful as a benchmark for defensive, regulated cash-flow exposure. Compare its volatility, rate sensitivity, and earnings drivers against a technology-heavy watchlist.",
+        },
+        {
+            "ticker": "VDC",
+            "name": "Vanguard Consumer Staples ETF",
+            "angle": "Consumer staples can provide a lens into demand that is less tied to enterprise AI budgets or growth-stock sentiment. Review margin durability, pricing power, and recession sensitivity as comparison points.",
+        },
+        {
+            "ticker": "XLV",
+            "name": "Health Care Select Sector SPDR ETF",
+            "angle": "Healthcare exposure can help compare different demand drivers such as demographics, regulated reimbursement, patents, and medical utilization. It is a research area for testing whether portfolio risk is too dependent on tech cycles.",
+        },
+        {
+            "ticker": "VIS",
+            "name": "Vanguard Industrials ETF",
+            "angle": "Industrials can add a real-economy comparison set tied to capital spending, logistics, infrastructure, and manufacturing cycles. Use it to study whether watchlist companies share the same valuation and catalyst profile as physical-economy businesses.",
+        },
+        {
+            "ticker": "VEA",
+            "name": "Vanguard FTSE Developed Markets ETF",
+            "angle": "Developed international exposure is a way to research geographic, currency, valuation, and macro-cycle differences. Compare earnings composition and currency sensitivity against the current watchlist.",
+        },
+        {
+            "ticker": "BIL",
+            "name": "SPDR Bloomberg 1-3 Month T-Bill ETF",
+            "angle": "A short-term Treasury bill proxy can help frame liquidity, rate sensitivity, and cash-like opportunity costs. It is useful for research on volatility ballast rather than equity upside.",
+        },
+    ]
+    if "technology" in sectors:
+        ideas.extend(
+            [
+                {
+                    "ticker": "JNJ",
+                    "name": "Johnson & Johnson",
+                    "angle": "A large healthcare business offers a comparison case with product, litigation, patent, and reimbursement risks rather than AI/software adoption risk. Review whether its revenue durability behaves differently from high-growth technology names.",
+                },
+                {
+                    "ticker": "NEE",
+                    "name": "NextEra Energy",
+                    "angle": "NextEra can be studied as a utility and renewables operator with regulated cash flows, capital intensity, and rate sensitivity. Compare those risks against software/platform businesses and AI infrastructure narratives.",
+                },
+                {
+                    "ticker": "UNP",
+                    "name": "Union Pacific",
+                    "angle": "Union Pacific provides an industrial rail comparison tied to freight volumes, pricing, fuel costs, and economic activity. It can help stress-test whether the watchlist is missing real-economy cyclicality and infrastructure exposure.",
+                },
+            ]
+        )
+    return ideas[:9]
+
+
 def _field(item: Any, name: str) -> Any:
     if isinstance(item, dict):
         return item.get(name)

@@ -26,7 +26,7 @@ class WatchlistRepository:
         self.session = session
 
     def list_active(self) -> list[WatchlistStock]:
-        return list(self.session.scalars(select(WatchlistStock).where(WatchlistStock.active.is_(True)).order_by(WatchlistStock.symbol)))
+        return list(self.session.scalars(active_watchlist_statement()))
 
     def list_all(self) -> list[WatchlistStock]:
         return list(self.session.scalars(select(WatchlistStock).order_by(WatchlistStock.symbol)))
@@ -52,9 +52,17 @@ class WatchlistRepository:
                 WatchlistStock.exchange == normalized_exchange,
             )
         )
+        if stock is None and normalized_exchange is not None:
+            stock = self.session.scalar(
+                select(WatchlistStock).where(
+                    WatchlistStock.symbol == normalized_symbol,
+                    WatchlistStock.exchange.is_(None),
+                )
+            )
         if stock is None:
             stock = WatchlistStock(symbol=normalized_symbol, exchange=normalized_exchange)
             self.session.add(stock)
+        stock.exchange = normalized_exchange
         stock.country_region = country_region
         stock.currency = currency
         stock.company_name = company_name
@@ -98,11 +106,36 @@ class ResearchRepository:
         self.session.commit()
         return item
 
+    def save_price_history(self, stock: WatchlistStock, snapshots: list[dict[str, Any]]) -> int:
+        saved = 0
+        for snapshot in snapshots:
+            self.save_price_snapshot(stock, snapshot)
+            saved += 1
+        return saved
+
     def save_event(self, stock: WatchlistStock, event: dict[str, Any]) -> StockEvent:
+        title = event.get("title") or "Untitled event"
+        source_url = event.get("source_url")
+        event_date = event.get("event_date")
+        existing_stmt = select(StockEvent).where(StockEvent.stock_id == stock.id)
+        if source_url:
+            existing_stmt = existing_stmt.where(StockEvent.source_url == source_url)
+        else:
+            existing_stmt = existing_stmt.where(StockEvent.title == title, StockEvent.event_date == event_date)
+        existing = self.session.scalar(existing_stmt)
+        if existing:
+            existing.title = title
+            existing.summary = event.get("summary")
+            existing.source_name = event.get("source_name")
+            existing.sentiment = event.get("sentiment")
+            existing.impact = event.get("impact")
+            existing.raw_payload = json.dumps(event.get("raw_payload", {}), default=str)
+            self.session.commit()
+            return existing
         item = StockEvent(
             stock_id=stock.id,
-            event_date=event.get("event_date"),
-            title=event.get("title") or "Untitled event",
+            event_date=event_date,
+            title=title,
             summary=event.get("summary"),
             source_url=event.get("source_url"),
             source_name=event.get("source_name"),
@@ -119,7 +152,16 @@ class ResearchRepository:
         return list(self.session.scalars(stmt))
 
     def recent_events(self, stock_id: int, limit: int = 10) -> list[StockEvent]:
-        stmt = select(StockEvent).where(StockEvent.stock_id == stock_id).order_by(desc(StockEvent.created_at)).limit(limit)
+        stmt = select(StockEvent).where(StockEvent.stock_id == stock_id).order_by(desc(StockEvent.event_date), desc(StockEvent.created_at)).limit(limit)
+        return list(self.session.scalars(stmt))
+
+    def events_since(self, stock_id: int, since: date, limit: int = 50) -> list[StockEvent]:
+        stmt = (
+            select(StockEvent)
+            .where(StockEvent.stock_id == stock_id, StockEvent.event_date >= since)
+            .order_by(desc(StockEvent.event_date), desc(StockEvent.created_at))
+            .limit(limit)
+        )
         return list(self.session.scalars(stmt))
 
     def save_report(
@@ -161,3 +203,6 @@ class AgentThreadRepository:
             self.session.commit()
         return thread
 
+
+def active_watchlist_statement():
+    return select(WatchlistStock).where(WatchlistStock.active == True).order_by(WatchlistStock.symbol)  # noqa: E712

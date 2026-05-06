@@ -8,16 +8,27 @@ from stonk_tracker_agent.db.repositories import ResearchRepository, WatchlistRep
 
 
 class FakeMarketProvider:
-    def get_snapshot(self, symbol: str):
-        return {
-            "snapshot_date": date(2026, 5, 1),
-            "open_price": "100",
-            "high_price": "110",
-            "low_price": "99",
-            "close_price": "108",
-            "volume": 2000,
-            "raw_payload": {"symbol": symbol},
-        }
+    def get_history(self, symbol: str, days: int = 90):
+        return [
+            {
+                "snapshot_date": date(2026, 4, 30),
+                "open_price": "98",
+                "high_price": "101",
+                "low_price": "97",
+                "close_price": "100",
+                "volume": 1000,
+                "raw_payload": {"symbol": symbol},
+            },
+            {
+                "snapshot_date": date(2026, 5, 1),
+                "open_price": "100",
+                "high_price": "110",
+                "low_price": "99",
+                "close_price": "108",
+                "volume": 2200,
+                "raw_payload": {"symbol": symbol},
+            },
+        ]
 
 
 class FakeSearchProvider:
@@ -51,4 +62,5 @@ def test_report_graph_persists_report(session, tmp_path):
     reports = ResearchRepository(session).list_reports()
     assert len(reports) == 1
     assert result["report_path"]
-
+    assert len(ResearchRepository(session).recent_snapshots(1)) == 2
+    assert len(ResearchRepository(session).recent_events(1)) == 1

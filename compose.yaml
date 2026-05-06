@@ -8,11 +8,11 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-}
       SQLITE_DATABASE_URL: ${SQLITE_DATABASE_URL:-sqlite:////data/stonk_tracker_local.db}
-      DB_SERVER: ${DB_SERVER:-}
+      MSSQL_SERVER: ${MSSQL_SERVER:-}
       DB_PORT: ${DB_PORT:-1433}
-      DB_NAME: ${DB_NAME:-}
-      DB_USER: ${DB_USER:-}
-      DB_PASSWORD: ${DB_PASSWORD:-}
+      MSSQL_STONK_DB: ${MSSQL_STONK_DB:-}
+      MSSQL_USER_WB: ${MSSQL_USER_WB:-}
+      MSSQL_PASS_WB: ${MSSQL_PASS_WB:-}
       DB_DRIVER: ${DB_DRIVER:-ODBC Driver 18 for SQL Server}
       DB_TRUST_SERVER_CERTIFICATE: ${DB_TRUST_SERVER_CERTIFICATE:-true}
       DB_ENCRYPT: ${DB_ENCRYPT:-true}

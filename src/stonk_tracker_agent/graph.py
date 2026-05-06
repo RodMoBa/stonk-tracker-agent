@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 
 from langchain_openai import ChatOpenAI
@@ -12,7 +12,7 @@ from stonk_tracker_agent.analysis import classify_event, detect_outliers, divers
 from stonk_tracker_agent.config import Settings, get_settings
 from stonk_tracker_agent.db.models import WatchlistStock
 from stonk_tracker_agent.db.repositories import ResearchRepository, WatchlistRepository
-from stonk_tracker_agent.providers.market import AlphaVantageMarketDataProvider, MarketDataProvider, NullMarketDataProvider
+from stonk_tracker_agent.providers.market import MarketDataProvider, YFinanceMarketDataProvider
 from stonk_tracker_agent.providers.search import NullSearchProvider, SearchProvider, TavilySearchProvider
 from stonk_tracker_agent.reports import render_markdown_report, save_markdown_report
 
@@ -21,7 +21,7 @@ class ReportState(TypedDict, total=False):
     run_started_at: datetime
     run_finished_at: datetime
     stocks: list[Any]
-    snapshots: dict[str, dict[str, Any] | None]
+    snapshots: dict[str, list[dict[str, Any]]]
     events: dict[str, list[dict[str, Any]]]
     price_findings: dict[str, list[str]]
     diversification: list[str]
@@ -39,11 +39,7 @@ def build_report_graph(
     search_provider: SearchProvider | None = None,
 ):
     settings = settings or get_settings()
-    market_provider = market_provider or (
-        AlphaVantageMarketDataProvider(settings.alpha_vantage_api_key)
-        if settings.alpha_vantage_api_key
-        else NullMarketDataProvider()
-    )
+    market_provider = market_provider or YFinanceMarketDataProvider()
     search_provider = search_provider or (TavilySearchProvider(settings.tavily_api_key) if settings.tavily_api_key else NullSearchProvider())
     research_repo = ResearchRepository(session)
     watchlist_repo = WatchlistRepository(session)
@@ -69,27 +65,45 @@ def build_report_graph(
         stocks = [stock_to_state(stock) for stock in watchlist_repo.list_active()]
         return {**state, "stocks": stocks, "messages": [*state.get("messages", []), f"Loaded {len(stocks)} active stocks."]}
 
-    def fetch_prices(state: ReportState) -> ReportState:
-        snapshots: dict[str, dict[str, Any] | None] = {}
+    def ingest_price_history(state: ReportState) -> ReportState:
+        snapshots: dict[str, list[dict[str, Any]]] = {}
+        saved_count = 0
         for stock in state.get("stocks", []):
-            snapshot = market_provider.get_snapshot(stock["symbol"])
-            snapshots[stock["symbol"]] = snapshot
+            history = market_provider.get_history(stock["symbol"], days=90)
+            snapshots[stock["symbol"]] = history
             orm_stock = stock_from_state(stock)
-            if snapshot and orm_stock:
-                research_repo.save_price_snapshot(orm_stock, snapshot)
-        return {**state, "snapshots": snapshots, "messages": [*state.get("messages", []), "Fetched market snapshots."]}
+            if history and orm_stock:
+                saved_count += research_repo.save_price_history(orm_stock, history)
+        return {**state, "snapshots": snapshots, "messages": [*state.get("messages", []), f"Stored {saved_count} daily price rows from yfinance."]}
 
-    def search_events(state: ReportState) -> ReportState:
+    def ingest_events(state: ReportState) -> ReportState:
         events: dict[str, list[dict[str, Any]]] = {}
+        since = utc_now().date() - timedelta(days=30)
+        saved_count = 0
         for stock in state.get("stocks", []):
-            raw_events = search_provider.search_stock_news(symbol=stock["symbol"], company_name=stock.get("company_name"))
+            raw_events = search_provider.search_stock_news(symbol=stock["symbol"], company_name=stock.get("company_name"), days=30)
             classified = [classify_event(event) for event in raw_events]
-            events[stock["symbol"]] = classified
             orm_stock = stock_from_state(stock)
             for event in classified:
                 if orm_stock:
                     research_repo.save_event(orm_stock, event)
-        return {**state, "events": events, "messages": [*state.get("messages", []), "Captured recent web events."]}
+                    saved_count += 1
+            if orm_stock:
+                events[stock["symbol"]] = [
+                    {
+                        "title": item.title,
+                        "summary": item.summary,
+                        "source_url": item.source_url,
+                        "source_name": item.source_name,
+                        "event_date": item.event_date,
+                        "sentiment": item.sentiment,
+                        "impact": item.impact,
+                    }
+                    for item in research_repo.events_since(orm_stock.id, since)
+                ]
+            else:
+                events[stock["symbol"]] = classified
+        return {**state, "events": events, "messages": [*state.get("messages", []), f"Captured {saved_count} event candidates and loaded 30-day event history."]}
 
     def analyze(state: ReportState) -> ReportState:
         price_findings = {}
@@ -110,8 +124,13 @@ def build_report_graph(
             return {**state, "llm_summary": None, "messages": [*state.get("messages", []), "Skipped LLM summary; OPENAI_API_KEY is not set."]}
         llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0.2)
         prompt = (
-            "Write a concise long-term-first portfolio research summary. "
-            "Do not give autonomous trading instructions. Mention action ideas only as research support.\n\n"
+            "You are a portfolio research and diversification assistant. "
+            "Analyze the watchlist and write only the Executive Summary section for a larger report. "
+            "Do not provide financial advice. Do not tell the user to buy, sell, hold, short, average down, take profit, stop loss, rebalance, or allocate a specific percentage. "
+            "Frame outputs as educational research support, hypothesis generation, and due-diligence ideas. "
+            "Use language such as research idea, area to investigate, risk to monitor, diversification consideration, possible follow-up question, and not a trade instruction. "
+            "Summarize the main watchlist theme, biggest concentration risk, key short-term outliers, long-term research priorities, and diversification areas to investigate. "
+            "Keep it concise and specific.\n\n"
             f"Stocks: {[stock['symbol'] for stock in state.get('stocks', [])]}\n"
             f"Outliers: {state.get('price_findings', {})}\n"
             f"Diversification: {state.get('diversification', [])}\n"
@@ -149,23 +168,23 @@ def build_report_graph(
 
     graph = StateGraph(ReportState)
     graph.add_node("load_watchlist", load_watchlist)
-    graph.add_node("fetch_prices", fetch_prices)
-    graph.add_node("search_events", search_events)
+    graph.add_node("ingest_price_history", ingest_price_history)
+    graph.add_node("ingest_events", ingest_events)
     graph.add_node("analyze", analyze)
     graph.add_node("summarize", summarize)
     graph.add_node("persist_report", persist_report)
     graph.add_edge(START, "load_watchlist")
-    graph.add_edge("load_watchlist", "fetch_prices")
-    graph.add_edge("fetch_prices", "search_events")
-    graph.add_edge("search_events", "analyze")
+    graph.add_edge("load_watchlist", "ingest_price_history")
+    graph.add_edge("ingest_price_history", "ingest_events")
+    graph.add_edge("ingest_events", "analyze")
     graph.add_edge("analyze", "summarize")
     graph.add_edge("summarize", "persist_report")
     graph.add_edge("persist_report", END)
     return graph.compile(checkpointer=MemorySaver())
 
 
-def run_report(session: Session, thread_id: str = "daily-report") -> ReportState:
-    graph = build_report_graph(session)
+def run_report(session: Session, thread_id: str = "daily-report", settings: Settings | None = None) -> ReportState:
+    graph = build_report_graph(session, settings=settings)
     return graph.invoke(
         {"run_started_at": utc_now(), "messages": []},
         config={"configurable": {"thread_id": thread_id}},
