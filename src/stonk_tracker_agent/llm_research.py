@@ -7,16 +7,20 @@ from typing import Any
 
 from langchain_openai import ChatOpenAI
 
-from stonk_tracker_agent.analysis import classify_event, diversification_notes
+from stonk_tracker_agent.analysis import build_outlier_context, classify_event, diversification_notes
 from stonk_tracker_agent.config import Settings
 
 
+# Centralize model construction so every research pass uses the same selected
+# model and all non-LLM fallback paths can simply pass around `None`.
 def build_research_llm(settings: Settings) -> ChatOpenAI | None:
     if not settings.openai_api_key:
         return None
     return ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0.2)
 
 
+# Event curation is the first LLM gate: turn noisy raw search results into a
+# smaller set of company-specific, structured records for persistence.
 def curate_events_with_llm(
     llm: Any | None,
     *,
@@ -87,6 +91,8 @@ def curate_events_with_llm(
     return curated
 
 
+# This pass creates the high-level portfolio concentration narrative that the
+# report uses before it drills into specific comparison ideas.
 def synthesize_diversification_with_llm(
     llm: Any | None,
     *,
@@ -112,6 +118,69 @@ def synthesize_diversification_with_llm(
     return [note for note in notes if note] or diversification_notes(stocks)
 
 
+# Run a second diversification pass with live market search results so the
+# report can recommend current comparison categories and names instead of a
+# fixed internal menu.
+def research_diversification_options_with_llm(
+    llm: Any | None,
+    *,
+    search_provider: Any | None,
+    stocks: list[Any],
+    diversification_notes_list: list[str],
+    events_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, str]]]:
+    fallback = {"ideas": [], "candidates": []}
+    if llm is None or search_provider is None or not stocks:
+        return fallback
+    queries = _build_diversification_queries(stocks, diversification_notes_list)
+    search_results = []
+    for query in queries:
+        try:
+            search_results.extend(search_provider.search_market_context(query=query, days=30, max_results=6, topic="news"))
+        except Exception:
+            continue
+    prompt = (
+        "You are a portfolio diversification research assistant.\n"
+        "Use the portfolio snapshot and live web search results to propose research-oriented diversification options.\n"
+        "Return JSON only as an object with two keys:\n"
+        "ideas: array of 3 to 6 objects with keys area, examples, why.\n"
+        "candidates: array of 3 to 8 objects with keys ticker, name, angle.\n"
+        "Rules:\n"
+        "- Avoid repeating the current dominant exposure.\n"
+        "- Candidates can be equities, ETFs, or funds, but only include names that are clearly identifiable from the search context.\n"
+        "- Keep angle to 1-2 lines and frame everything as research support, not advice.\n"
+        "- Prefer concrete, current comparison ideas rather than generic textbook categories.\n\n"
+        f"Stocks: {json.dumps([_stock_brief(stock, include_thesis=True) for stock in stocks], default=str)}\n"
+        f"Diversification notes: {json.dumps(diversification_notes_list, default=str)}\n"
+        f"Recent events by symbol: {json.dumps(_event_headers_by_symbol(events_by_symbol), default=str)}\n"
+        f"Web search results: {json.dumps(search_results[:14], default=str)}"
+    )
+    parsed = _invoke_json(llm, prompt)
+    if not isinstance(parsed, dict):
+        return fallback
+    ideas = []
+    for item in parsed.get("ideas", []):
+        if not isinstance(item, dict):
+            continue
+        area = _clean_text(item.get("area"), max_length=160)
+        examples = _clean_text(item.get("examples"), max_length=220)
+        why = _clean_text(item.get("why"), max_length=320)
+        if area and examples and why:
+            ideas.append({"area": area, "examples": examples, "why": why})
+    candidates = []
+    for item in parsed.get("candidates", []):
+        if not isinstance(item, dict):
+            continue
+        ticker = _clean_text(item.get("ticker"), max_length=32)
+        name = _clean_text(item.get("name"), max_length=180)
+        angle = _clean_text(item.get("angle"), max_length=420)
+        if ticker and name and angle:
+            candidates.append({"ticker": ticker, "name": name, "angle": angle})
+    return {"ideas": ideas, "candidates": candidates}
+
+
+# Feed the model both heuristic flags and the underlying close/volume context
+# so it can explain why a move matters rather than just restating the math.
 def interpret_outliers_with_llm(
     llm: Any | None,
     *,
@@ -120,32 +189,37 @@ def interpret_outliers_with_llm(
     events: list[dict[str, Any]],
     heuristic_findings: list[str],
 ) -> list[str]:
-    if llm is None or not heuristic_findings:
-        return heuristic_findings
+    price_context = build_outlier_context(stock.get("symbol") or "", snapshots)
+    if llm is None:
+        return heuristic_findings or [price_context.get("message", "No major short-term outlier detected from captured snapshots.")]
     snapshot_brief = [
         {
             "date": getattr(snapshot, "snapshot_date", None),
             "close_price": str(getattr(snapshot, "close_price", "")),
             "volume": getattr(snapshot, "volume", None),
         }
-        for snapshot in snapshots[:5]
+        for snapshot in snapshots[:20]
     ]
     prompt = (
         "You are interpreting short-term stock outliers for research support.\n"
         "Return JSON only as an array of 1 to 3 concise strings.\n"
-        "Each string should explain why the move may matter, whether more data is needed, and frame it as a research task rather than a trade signal.\n\n"
+        "Each string should explain why the move may matter, whether more data is needed, and frame it as a research task rather than a trade signal.\n"
+        "Use the full price/volume context rather than merely paraphrasing a heuristic rule.\n\n"
         f"Stock: {json.dumps(_stock_brief(stock), default=str)}\n"
         f"Heuristic findings: {json.dumps(heuristic_findings, default=str)}\n"
+        f"Computed price context: {json.dumps(price_context, default=str)}\n"
         f"Recent snapshots: {json.dumps(snapshot_brief, default=str)}\n"
         f"Recent event headers: {json.dumps(_event_headers(events), default=str)}"
     )
     parsed = _invoke_json(llm, prompt)
     if not isinstance(parsed, list):
-        return heuristic_findings
+        return heuristic_findings or [price_context.get("message", "No major short-term outlier detected from captured snapshots.")]
     notes = [_clean_text(item, max_length=360) for item in parsed]
-    return [note for note in notes if note] or heuristic_findings
+    return [note for note in notes if note] or heuristic_findings or [price_context.get("message", "No major short-term outlier detected from captured snapshots.")]
 
 
+# This is the per-holding synthesis block that turns snapshots, events, and the
+# stored thesis into the note sections rendered in the markdown report.
 def generate_holding_note_with_llm(
     llm: Any | None,
     *,
@@ -163,7 +237,7 @@ def generate_holding_note_with_llm(
             "close_price": str(getattr(snapshot, "close_price", "")),
             "volume": getattr(snapshot, "volume", None),
         }
-        for snapshot in snapshots[:5]
+        for snapshot in snapshots[:20]
     ]
     prompt = (
         "You are writing holding-level research notes for a stock watchlist report.\n"
@@ -190,6 +264,8 @@ def generate_holding_note_with_llm(
     }
 
 
+# Deterministic note generation keeps the report usable when the OpenAI key is
+# missing or an LLM response cannot be parsed safely.
 def _fallback_holding_note(*, stock: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
     thesis = stock.get("long_term_thesis") or "No thesis stored yet; research business model, fundamentals, catalysts, and risks."
     event_titles = [event.get("title") for event in events[:3] if event.get("title")]
@@ -230,6 +306,8 @@ def _fallback_holding_note(*, stock: dict[str, Any], events: list[dict[str, Any]
     }
 
 
+# Keep prompt payloads compact and consistent so every LLM call receives the
+# same normalized stock shape.
 def _stock_brief(stock: Any, *, include_thesis: bool = False) -> dict[str, Any]:
     data = {
         "symbol": _field(stock, "symbol"),
@@ -243,6 +321,20 @@ def _stock_brief(stock: Any, *, include_thesis: bool = False) -> dict[str, Any]:
     if include_thesis:
         data["long_term_thesis"] = _truncate(_field(stock, "long_term_thesis") or "", 1200)
     return data
+
+
+# These search prompts are intentionally portfolio-level rather than single-name
+# so Tavily returns candidate sectors, ETFs, and comparison companies.
+def _build_diversification_queries(stocks: list[Any], diversification_notes_list: list[str]) -> list[str]:
+    sectors = sorted({(_field(stock, "sector") or "Unknown") for stock in stocks})
+    regions = sorted({(_field(stock, "country_region") or "Unknown") for stock in stocks})
+    currencies = sorted({(_field(stock, "currency") or "Unknown") for stock in stocks})
+    symbols = [_field(stock, "symbol") for stock in stocks[:8]]
+    themes = " ".join(diversification_notes_list[:3])
+    return [
+        f"portfolio diversification research ideas for watchlist with sectors {', '.join(sectors)} regions {', '.join(regions)} currencies {', '.join(currencies)} latest 30 days",
+        f"stocks or ETFs to compare against watchlist {' '.join(symbols)} concentration risk {themes} last 30 days",
+    ]
 
 
 def _event_headers(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -263,6 +355,8 @@ def _event_headers_by_symbol(events_by_symbol: dict[str, list[dict[str, Any]]]) 
     return {symbol: _event_headers(events) for symbol, events in events_by_symbol.items()}
 
 
+# LLM responses are constrained to JSON so we can validate and persist them
+# without trusting free-form prose formatting.
 def _invoke_json(llm: Any, prompt: str) -> Any | None:
     try:
         response = llm.invoke(prompt)
@@ -272,6 +366,7 @@ def _invoke_json(llm: Any, prompt: str) -> Any | None:
     return _extract_json(str(content))
 
 
+# Helpers below are defensive parsing/cleanup utilities for messy model output.
 def _extract_json(text: str) -> Any | None:
     stripped = text.strip()
     fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", stripped, flags=re.DOTALL)

@@ -16,6 +16,7 @@ from stonk_tracker_agent.llm_research import (
     curate_events_with_llm,
     generate_holding_note_with_llm,
     interpret_outliers_with_llm,
+    research_diversification_options_with_llm,
     synthesize_diversification_with_llm,
 )
 from stonk_tracker_agent.providers.market import MarketDataProvider, YFinanceMarketDataProvider
@@ -31,6 +32,8 @@ class ReportState(TypedDict, total=False):
     events: dict[str, list[dict[str, Any]]]
     price_findings: dict[str, list[str]]
     diversification: list[str]
+    diversification_ideas: list[dict[str, str]]
+    watchlist_ideas: list[dict[str, str]]
     holding_notes: dict[str, dict[str, Any]]
     llm_summary: str | None
     report_title: str
@@ -38,6 +41,8 @@ class ReportState(TypedDict, total=False):
     messages: list[str]
 
 
+# Build the end-to-end report workflow and keep each phase isolated so the state
+# written by one node can be reused by later nodes and by tests.
 def build_report_graph(
     session: Session,
     *,
@@ -52,6 +57,8 @@ def build_report_graph(
     research_repo = ResearchRepository(session)
     watchlist_repo = WatchlistRepository(session)
 
+    # Normalize ORM objects into JSON-like state so LangGraph can pass them
+    # cleanly between nodes without holding live SQLAlchemy objects.
     def stock_to_state(stock: Any) -> dict[str, Any]:
         return {
             "id": stock.id,
@@ -69,10 +76,14 @@ def build_report_graph(
     def stock_from_state(stock: dict[str, Any]) -> WatchlistStock | None:
         return session.get(WatchlistStock, stock["id"])
 
+    # Start from the active control table because the watchlist is the driver
+    # for every downstream research step.
     def load_watchlist(state: ReportState) -> ReportState:
         stocks = [stock_to_state(stock) for stock in watchlist_repo.list_active()]
         return {**state, "stocks": stocks, "messages": [*state.get("messages", []), f"Loaded {len(stocks)} active stocks."]}
 
+    # Pull a fresh rolling history for each symbol, then persist it so later
+    # analysis reads from the database-backed snapshot history.
     def ingest_price_history(state: ReportState) -> ReportState:
         snapshots: dict[str, list[dict[str, Any]]] = {}
         saved_count = 0
@@ -84,6 +95,9 @@ def build_report_graph(
                 saved_count += research_repo.save_price_history(orm_stock, history)
         return {**state, "snapshots": snapshots, "messages": [*state.get("messages", []), f"Stored {saved_count} daily price rows from yfinance."]}
 
+    # Gather recent headlines, let GPT curate them when configured, and then
+    # reload the last 30 days from the database so every later node sees the
+    # same persisted event set.
     def ingest_events(state: ReportState) -> ReportState:
         events: dict[str, list[dict[str, Any]]] = {}
         since = utc_now().date() - timedelta(days=30)
@@ -126,11 +140,13 @@ def build_report_graph(
             ],
         }
 
+    # Combine price history, stored events, and GPT reasoning into the richer
+    # per-symbol notes that the report renderer consumes directly.
     def analyze(state: ReportState) -> ReportState:
         price_findings: dict[str, list[str]] = {}
         holding_notes: dict[str, dict[str, Any]] = {}
         for stock in state.get("stocks", []):
-            snapshots = research_repo.recent_snapshots(stock["id"])
+            snapshots = research_repo.recent_snapshots(stock["id"], limit=30)
             heuristic_findings = detect_outliers(stock["symbol"], snapshots)
             stock_events = state.get("events", {}).get(stock["symbol"], [])
             interpreted_findings = interpret_outliers_with_llm(
@@ -157,17 +173,30 @@ def build_report_graph(
             if research_llm
             else diversification_notes(state.get("stocks", []))
         )
+        diversification_research = research_diversification_options_with_llm(
+            research_llm,
+            search_provider=search_provider,
+            stocks=state.get("stocks", []),
+            diversification_notes_list=diversification,
+            events_by_symbol=state.get("events", {}),
+        )
         return {
             **state,
             "price_findings": price_findings,
             "diversification": diversification,
+            "diversification_ideas": diversification_research.get("ideas", []),
+            "watchlist_ideas": diversification_research.get("candidates", []),
             "holding_notes": holding_notes,
             "messages": [
                 *state.get("messages", []),
-                "Generated GPT research notes for outliers, holdings, and diversification." if research_llm else "Analyzed outliers and diversification.",
+                "Generated GPT research notes, live diversification research ideas, and outlier interpretation."
+                if research_llm
+                else "Analyzed outliers and diversification.",
             ],
         }
 
+    # The executive summary is a final synthesis pass over everything already
+    # computed, not the place where raw research logic happens.
     def summarize(state: ReportState) -> ReportState:
         if not state.get("stocks"):
             return {**state, "llm_summary": None, "messages": [*state.get("messages", []), "Skipped LLM summary; watchlist is empty."]}
@@ -190,6 +219,8 @@ def build_report_graph(
         response = research_llm.invoke(prompt)
         return {**state, "llm_summary": response.content, "messages": [*state.get("messages", []), "Generated LLM summary."]}
 
+    # Render the final markdown artifact and store report metadata so the UI
+    # can list prior runs without re-executing the graph.
     def persist_report(state: ReportState) -> ReportState:
         finished_at = utc_now()
         title, content = render_markdown_report(
@@ -197,6 +228,8 @@ def build_report_graph(
             price_findings=state.get("price_findings", {}),
             events=state.get("events", {}),
             diversification=state.get("diversification", []),
+            diversification_ideas=state.get("diversification_ideas", []),
+            watchlist_ideas=state.get("watchlist_ideas", []),
             holding_notes=state.get("holding_notes", {}),
             llm_summary=state.get("llm_summary"),
             generated_at=finished_at,
@@ -218,6 +251,8 @@ def build_report_graph(
             "messages": [*state.get("messages", []), f"Saved report to {path}."],
         }
 
+    # The node order mirrors the intended research pipeline from ingestion to
+    # interpretation to final report persistence.
     graph = StateGraph(ReportState)
     graph.add_node("load_watchlist", load_watchlist)
     graph.add_node("ingest_price_history", ingest_price_history)
@@ -235,6 +270,8 @@ def build_report_graph(
     return graph.compile(checkpointer=MemorySaver())
 
 
+# Keep the public entrypoint thin so callers can swap settings or thread ids
+# without needing to know how the graph itself is assembled.
 def run_report(session: Session, thread_id: str = "daily-report", settings: Settings | None = None) -> ReportState:
     graph = build_report_graph(session, settings=settings)
     return graph.invoke(
