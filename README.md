@@ -102,6 +102,28 @@ Run tests:
 pytest
 ```
 
+## Windows EXE Build
+
+Build a double-clickable Windows launcher with PyInstaller:
+
+```powershell
+pip install pyinstaller
+pyinstaller StonkTracker.spec --clean
+```
+
+The packaged app will be created at:
+
+```text
+dist\StonkTracker.exe
+```
+
+When launched, the exe starts Streamlit for this app and writes its default local files next to the exe:
+
+- `stonk_tracker_local.db`
+- `reports\`
+
+The exe still reads environment variables such as `OPENAI_API_KEY`, `TAVILY_API_KEY`, `MSSQL_SERVER`, `MSSQL_STONK_DB`, `MSSQL_USER_WB`, and `MSSQL_PASS_WB` if you want OpenAI, Tavily, or SQL Server enabled.
+
 ## Environment
 
 - `DATABASE_URL`: optional SQLAlchemy database URL override for non-standard cases. Split SQL Server settings take precedence when `MSSQL_SERVER` and `MSSQL_STONK_DB` are set.

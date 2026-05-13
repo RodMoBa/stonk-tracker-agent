@@ -33,6 +33,7 @@ def render_markdown_report(
     price_findings: dict[str, list[str]],
     events: dict[str, list[dict[str, Any]]],
     diversification: list[str],
+    holding_notes: dict[str, dict[str, Any]] | None = None,
     llm_summary: str | None,
     generated_at: datetime,
 ) -> tuple[str, str]:
@@ -82,18 +83,19 @@ def render_markdown_report(
         priority = _field(stock, "priority")
         thesis = _field(stock, "long_term_thesis") or "No thesis stored yet; research business model, fundamentals, catalysts, and risks."
         stock_events = events.get(symbol, [])
+        note = (holding_notes or {}).get(symbol, {})
         lines.extend(
             [
                 f"### {symbol} - {name}",
                 "",
                 f"- Facts: exchange `{exchange}`, sector `{sector}`, region `{region}`, currency `{currency}`, priority `{priority}`.",
-                f"- Current thesis summary: {thesis}",
-                "- Main positive drivers to research: revenue durability, margin trend, balance sheet quality, product/customer momentum, and whether recent news supports the thesis.",
-                "- Main risks to monitor: valuation sensitivity, liquidity, customer concentration, funding conditions, competition, execution risk, and repeated negative catalysts.",
-                f"- Recent event interpretation: {_event_interpretation(stock_events)}",
-                "- Key metrics to monitor: revenue growth, free cash flow, gross/operating margins, debt maturity profile, volume/liquidity, valuation multiples, and catalyst calendar.",
-                "- Research questions for the next 1-4 quarters: What evidence would strengthen or weaken the thesis? Are news-driven moves confirmed by fundamentals? Is risk concentrated in the same macro or sector narrative as other holdings?",
-                "- Research-only action ideas: compare this company with sector peers, review the next earnings transcript, track segment growth, and build a catalyst calendar. This is not a trade instruction.",
+                f"- Current thesis summary: {note.get('thesis_summary') or thesis}",
+                f"- Main positive drivers to research: {_join_items(note.get('positive_drivers')) or 'Revenue durability, margin trend, balance sheet quality, product/customer momentum, and whether recent news supports the thesis.'}",
+                f"- Main risks to monitor: {_join_items(note.get('risks')) or 'Valuation sensitivity, liquidity, customer concentration, funding conditions, competition, execution risk, and repeated negative catalysts.'}",
+                f"- Recent event interpretation: {note.get('recent_event_interpretation') or _event_interpretation(stock_events)}",
+                f"- Key metrics to monitor: {_join_items(note.get('metrics_to_monitor')) or 'Revenue growth, free cash flow, gross/operating margins, debt maturity profile, volume/liquidity, valuation multiples, and catalyst calendar.'}",
+                f"- Research questions for the next 1-4 quarters: {_join_items(note.get('research_questions')) or 'What evidence would strengthen or weaken the thesis? Are news-driven moves confirmed by fundamentals? Is risk concentrated in the same macro or sector narrative as other holdings?'}",
+                f"- Research-only action ideas: {_join_items(note.get('research_actions')) or 'Compare this company with sector peers, review the next earnings transcript, track segment growth, and build a catalyst calendar.'} This is not a trade instruction.",
                 "",
             ]
         )
@@ -112,7 +114,7 @@ def render_markdown_report(
         for event in stock_events:
             source = f" [{event.get('source_name') or 'source'}]({event.get('source_url')})" if event.get("source_url") else ""
             lines.append(f"- **{event.get('impact', 'low')} / {event.get('sentiment', 'neutral')}**: {event.get('title')}{source}")
-            if event.get("summary"):
+            if _should_render_event_summary(event):
                 lines.append(f"  {str(event['summary'])[:1200]}")
 
     lines.extend(["", "## Cross-Holding Risk Notes", ""])
@@ -283,6 +285,21 @@ def _event_interpretation(stock_events: list[dict[str, Any]]) -> str:
         return "No recent stored events were found; collect more news history before drawing conclusions."
     titles = [event.get("title") for event in stock_events[:3] if event.get("title")]
     return "Recent stored events to review include: " + "; ".join(titles) + ". Treat these as due-diligence prompts, not trade signals."
+
+
+def _should_render_event_summary(event: dict[str, Any]) -> bool:
+    source_name = str(event.get("source_name") or "").lower()
+    summary = str(event.get("summary") or "").strip()
+    if not summary:
+        return False
+    return source_name == "yahoo finance"
+
+
+def _join_items(value: Any) -> str | None:
+    if not isinstance(value, list):
+        return None
+    items = [" ".join(str(item).split()).strip() for item in value if str(item).strip()]
+    return "; ".join(items) if items else None
 
 
 def _cross_holding_risk_notes(stocks: list[Any]) -> list[str]:
