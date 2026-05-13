@@ -5,6 +5,8 @@ from decimal import Decimal
 from typing import Any
 
 
+# Lightweight keyword scoring is the deterministic fallback when GPT curation
+# is unavailable during event ingestion.
 def classify_event(event: dict[str, Any]) -> dict[str, Any]:
     text = f"{event.get('title', '')} {event.get('summary', '')}".lower()
     negative_terms = ["lawsuit", "miss", "downgrade", "probe", "recall", "loss", "layoff", "warning", "cuts"]
@@ -18,23 +20,69 @@ def classify_event(event: dict[str, Any]) -> dict[str, Any]:
     return {**event, "sentiment": sentiment, "impact": impact}
 
 
+# Surface obvious moves quickly, then let the LLM decide how to interpret the
+# richer context for the report.
 def detect_outliers(symbol: str, snapshots: list[Any]) -> list[str]:
-    if len(snapshots) < 2:
-        return ["Stale or insufficient price history; collect more snapshots before judging short-term outliers."]
-    latest = snapshots[0]
-    previous = snapshots[1]
-    if latest.close_price is None or previous.close_price in (None, Decimal("0")):
-        return ["Latest or previous close price is missing."]
-    change = (Decimal(latest.close_price) - Decimal(previous.close_price)) / Decimal(previous.close_price)
+    context = build_outlier_context(symbol, snapshots)
+    if context["status"] != "ok":
+        return [context["message"]]
     findings: list[str] = []
-    if abs(change) >= Decimal("0.05"):
+    change = context["latest_change_1d"]
+    if change is not None and abs(change) >= Decimal("0.05"):
         direction = "up" if change > 0 else "down"
         findings.append(f"{symbol} moved {direction} {change:.2%} versus the prior captured close.")
-    if latest.volume and previous.volume and latest.volume >= previous.volume * 2:
+    if context["volume_ratio_1d"] is not None and context["volume_ratio_1d"] >= Decimal("2"):
         findings.append(f"{symbol} volume is at least 2x the previous captured volume.")
+    if context["change_5d"] is not None and abs(context["change_5d"]) >= Decimal("0.10"):
+        direction = "up" if context["change_5d"] > 0 else "down"
+        findings.append(f"{symbol} moved {direction} {context['change_5d']:.2%} over the last 5 captured closes.")
     return findings or ["No major short-term outlier detected from captured snapshots."]
 
 
+# Package the recent close and volume history into a structured summary so the
+# LLM can reason over real stored pricing context rather than a single formula.
+def build_outlier_context(symbol: str, snapshots: list[Any]) -> dict[str, Any]:
+    if len(snapshots) < 2:
+        return {
+            "symbol": symbol,
+            "status": "insufficient",
+            "message": "Stale or insufficient price history; collect more snapshots before judging short-term outliers.",
+        }
+    latest = snapshots[0]
+    previous = snapshots[1]
+    if latest.close_price is None or previous.close_price in (None, Decimal("0")):
+        return {
+            "symbol": symbol,
+            "status": "missing_prices",
+            "message": "Latest or previous close price is missing.",
+        }
+    closes = [Decimal(snapshot.close_price) for snapshot in snapshots if getattr(snapshot, "close_price", None) not in (None, "")]
+    volumes = [snapshot.volume for snapshot in snapshots if getattr(snapshot, "volume", None) is not None]
+    latest_change_1d = _pct_change(Decimal(latest.close_price), Decimal(previous.close_price))
+    volume_ratio_1d = None
+    if latest.volume and previous.volume:
+        volume_ratio_1d = Decimal(str(latest.volume)) / Decimal(str(previous.volume))
+    return {
+        "symbol": symbol,
+        "status": "ok",
+        "latest_snapshot_date": getattr(latest, "snapshot_date", None),
+        "latest_close": Decimal(latest.close_price),
+        "previous_close": Decimal(previous.close_price),
+        "latest_change_1d": latest_change_1d,
+        "change_5d": _window_change(closes, 5),
+        "change_20d": _window_change(closes, 20),
+        "close_range_20d": _range_ratio(closes[:20]),
+        "average_volume_5d": _average(volumes[:5]),
+        "average_volume_20d": _average(volumes[:20]),
+        "latest_volume": latest.volume,
+        "volume_ratio_1d": volume_ratio_1d,
+        "recent_closes": [str(close) for close in closes[:20]],
+        "recent_volumes": volumes[:20],
+    }
+
+
+# These notes remain as deterministic fallbacks when live search or GPT-based
+# diversification synthesis is unavailable.
 def diversification_notes(stocks: list[Any]) -> list[str]:
     if not stocks:
         return ["Add watchlist stocks before diversification analysis can run."]
@@ -53,81 +101,82 @@ def diversification_notes(stocks: list[Any]) -> list[str]:
     return notes
 
 
+# Keep a minimal non-static fallback shape for the report table; the normal path
+# now comes from live search plus GPT synthesis in llm_research.py.
 def diversification_research_ideas(stocks: list[Any]) -> list[dict[str, str]]:
-    sectors = {(_field(stock, "sector") or "Unknown").lower() for stock in stocks}
-    regions = {(_field(stock, "country_region") or "Unknown").lower() for stock in stocks}
-    ideas = [
-        {"area": "Defensive sectors", "examples": "Utilities, consumer staples, telecom", "why": "Compare against growth-heavy or catalyst-dependent exposure."},
-        {"area": "Healthcare", "examples": "Large-cap pharmaceuticals, medical devices, healthcare services", "why": "Research whether earnings drivers differ from technology and AI narratives."},
-        {"area": "Industrials and infrastructure", "examples": "Railroads, automation, electrical equipment, infrastructure services", "why": "Investigate exposure tied to capital spending, reshoring, and infrastructure demand."},
-        {"area": "Cash-flow and dividend-focused businesses", "examples": "Mature cash-generative companies; dividend-focused screens", "why": "Compare durability of cash flows against high-growth valuation sensitivity."},
-        {"area": "Broad market or factor ETFs", "examples": "Broad index, value, quality, low-volatility, equal-weight screens", "why": "Benchmark concentration risk and single-company risk against diversified baskets."},
-        {"area": "Fixed income or cash-like instruments", "examples": "Treasury bills, investment-grade bond funds, money-market style instruments", "why": "Research ballast, liquidity, and interest-rate sensitivity outside equities."},
-        {"area": "International exposure", "examples": "Developed ex-US, Europe, Japan, emerging-market screens", "why": "Compare geographic, currency, valuation, and macro-cycle differences."},
-        {"area": "Commodities and real assets", "examples": "Energy, metals, commodity producers, real-asset infrastructure", "why": "Investigate inflation, supply-chain, and commodity-cycle sensitivity."},
-    ]
-    if "technology" in sectors or "communication services" in sectors:
-        ideas.insert(0, {"area": "Non-tech cash-flow businesses", "examples": "Insurance, logistics, consumer staples, selected financials", "why": "Stress-test whether the watchlist depends too heavily on AI/software/growth narratives."})
-    if len(regions) <= 1:
-        ideas.insert(0, {"area": "Non-domestic market exposure", "examples": "Europe, Japan, developed ex-US, selective emerging-market screens", "why": "Research whether currency and regional macro exposure are concentrated."})
-    return ideas
+    notes = diversification_notes(stocks)
+    areas = []
+    if any("concentrated in" in note.lower() for note in notes):
+        areas.append(
+            {
+                "area": "Adjacent sectors",
+                "examples": "Industrials, healthcare, consumer staples, utilities, selected financials",
+                "why": "Useful when a watchlist appears concentrated in one dominant sector or growth narrative.",
+            }
+        )
+    if any("currency exposure" in note.lower() or "region" in note.lower() for note in notes):
+        areas.append(
+            {
+                "area": "International exposure",
+                "examples": "Developed ex-US, Europe, Japan, broad international ETFs, country-specific leaders",
+                "why": "Helps compare valuation, policy, and macro-cycle differences outside the existing region mix.",
+            }
+        )
+    areas.append(
+        {
+            "area": "Cash-flow resilience",
+            "examples": "Defensive sectors, mature compounders, income-oriented funds, infrastructure",
+            "why": "Useful for comparing steadier cash generation against more cyclical or narrative-driven holdings.",
+        }
+    )
+    return areas
 
 
+# The renderer expects some comparison block even when dynamic research fails,
+# so this fallback is intentionally generic.
 def candidate_watchlist_research_ideas(stocks: list[Any]) -> list[dict[str, str]]:
     sectors = {(_field(stock, "sector") or "").lower() for stock in stocks}
-    ideas = [
+    primary_sector = sorted(sectors)[0] if sectors else "current exposure"
+    return [
         {
-            "ticker": "XLU",
-            "name": "Utilities Select Sector SPDR ETF",
-            "angle": "A utilities basket can be useful as a benchmark for defensive, regulated cash-flow exposure. Compare its volatility, rate sensitivity, and earnings drivers against a technology-heavy watchlist.",
-        },
-        {
-            "ticker": "VDC",
-            "name": "Vanguard Consumer Staples ETF",
-            "angle": "Consumer staples can provide a lens into demand that is less tied to enterprise AI budgets or growth-stock sentiment. Review margin durability, pricing power, and recession sensitivity as comparison points.",
-        },
-        {
-            "ticker": "XLV",
-            "name": "Health Care Select Sector SPDR ETF",
-            "angle": "Healthcare exposure can help compare different demand drivers such as demographics, regulated reimbursement, patents, and medical utilization. It is a research area for testing whether portfolio risk is too dependent on tech cycles.",
-        },
-        {
-            "ticker": "VIS",
-            "name": "Vanguard Industrials ETF",
-            "angle": "Industrials can add a real-economy comparison set tied to capital spending, logistics, infrastructure, and manufacturing cycles. Use it to study whether watchlist companies share the same valuation and catalyst profile as physical-economy businesses.",
-        },
-        {
-            "ticker": "VEA",
-            "name": "Vanguard FTSE Developed Markets ETF",
-            "angle": "Developed international exposure is a way to research geographic, currency, valuation, and macro-cycle differences. Compare earnings composition and currency sensitivity against the current watchlist.",
-        },
-        {
-            "ticker": "BIL",
-            "name": "SPDR Bloomberg 1-3 Month T-Bill ETF",
-            "angle": "A short-term Treasury bill proxy can help frame liquidity, rate sensitivity, and cash-like opportunity costs. It is useful for research on volatility ballast rather than equity upside.",
-        },
+            "ticker": "TBD",
+            "name": "Dynamic research candidate",
+            "angle": f"Use live search and model synthesis to find comparison names outside {primary_sector} concentration rather than relying on a fixed internal list.",
+        }
     ]
-    if "technology" in sectors:
-        ideas.extend(
-            [
-                {
-                    "ticker": "JNJ",
-                    "name": "Johnson & Johnson",
-                    "angle": "A large healthcare business offers a comparison case with product, litigation, patent, and reimbursement risks rather than AI/software adoption risk. Review whether its revenue durability behaves differently from high-growth technology names.",
-                },
-                {
-                    "ticker": "NEE",
-                    "name": "NextEra Energy",
-                    "angle": "NextEra can be studied as a utility and renewables operator with regulated cash flows, capital intensity, and rate sensitivity. Compare those risks against software/platform businesses and AI infrastructure narratives.",
-                },
-                {
-                    "ticker": "UNP",
-                    "name": "Union Pacific",
-                    "angle": "Union Pacific provides an industrial rail comparison tied to freight volumes, pricing, fuel costs, and economic activity. It can help stress-test whether the watchlist is missing real-economy cyclicality and infrastructure exposure.",
-                },
-            ]
-        )
-    return ideas[:9]
+
+
+# Small helpers below keep the outlier-context math readable inside the main
+# function above.
+def _pct_change(current: Decimal, previous: Decimal) -> Decimal | None:
+    if previous == 0:
+        return None
+    return (current - previous) / previous
+
+
+def _window_change(closes: list[Decimal], window: int) -> Decimal | None:
+    if len(closes) < window:
+        return None
+    current = closes[0]
+    baseline = closes[window - 1]
+    return _pct_change(current, baseline)
+
+
+def _average(values: list[Any]) -> Decimal | None:
+    cleaned = [Decimal(str(value)) for value in values if value not in (None, "")]
+    if not cleaned:
+        return None
+    return sum(cleaned) / Decimal(len(cleaned))
+
+
+def _range_ratio(closes: list[Decimal]) -> Decimal | None:
+    if len(closes) < 2:
+        return None
+    low = min(closes)
+    high = max(closes)
+    if low == 0:
+        return None
+    return (high - low) / low
 
 
 def _field(item: Any, name: str) -> Any:

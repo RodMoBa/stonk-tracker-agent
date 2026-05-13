@@ -8,6 +8,8 @@ from pathlib import Path
 from streamlit.web import cli as stcli
 
 
+# In a packaged build, runtime files should live next to the exe; during local
+# development they should live next to this launcher script.
 def _runtime_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -20,6 +22,8 @@ def _bundle_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+# This launcher hides the Streamlit CLI details and makes the app behave like a
+# normal double-clickable desktop entrypoint.
 def main() -> int:
     runtime_root = _runtime_root()
     bundle_root = _bundle_root()
@@ -33,6 +37,8 @@ def main() -> int:
 
     os.chdir(runtime_root)
 
+    # Streamlit runs the target script in a different execution context, so we
+    # explicitly seed both sys.path and PYTHONPATH with the bundled src tree.
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
     pythonpath_parts = [str(source_root)]
@@ -41,6 +47,8 @@ def main() -> int:
         pythonpath_parts.append(existing_pythonpath)
     os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
 
+    # Provide sensible local defaults so the packaged app can boot even before
+    # someone wires SQL Server or external report storage.
     sqlite_path = runtime_root / "stonk_tracker_local.db"
     reports_path = runtime_root / "reports"
     os.environ.setdefault("SQLITE_DATABASE_URL", f"sqlite:///{sqlite_path.as_posix()}")
@@ -50,6 +58,8 @@ def main() -> int:
     address = os.environ.get("STREAMLIT_SERVER_ADDRESS", "127.0.0.1")
     auto_open = os.environ.get("STREAMLIT_AUTO_OPEN_BROWSER", "true").lower() not in {"0", "false", "no"}
 
+    # Delegate to Streamlit's CLI entrypoint instead of importing the app
+    # module directly so behavior matches `streamlit run`.
     sys.argv = [
         "streamlit",
         "run",

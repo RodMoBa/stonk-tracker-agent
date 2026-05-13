@@ -37,6 +37,16 @@ class SearchProvider(Protocol):
     def search_stock_news(self, *, symbol: str, company_name: str | None, days: int = 7) -> list[dict[str, Any]]:
         ...
 
+    def search_market_context(
+        self,
+        *,
+        query: str,
+        days: int = 30,
+        max_results: int = 8,
+        topic: str = "news",
+    ) -> list[dict[str, Any]]:
+        ...
+
 
 class TavilySearchProvider:
     def __init__(self, api_key: str | None, timeout_seconds: int = 20):
@@ -78,9 +88,60 @@ class TavilySearchProvider:
             )
         return events
 
+    def search_market_context(
+        self,
+        *,
+        query: str,
+        days: int = 30,
+        max_results: int = 8,
+        topic: str = "news",
+    ) -> list[dict[str, Any]]:
+        if not self.api_key:
+            return []
+        payload = {
+            "api_key": self.api_key,
+            "query": query,
+            "search_depth": "advanced",
+            "topic": topic,
+            "days": days,
+            "max_results": max_results,
+            "include_answer": False,
+        }
+        response = requests.post(self.base_url, json=payload, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for item in data.get("results", []):
+            if _looks_like_navigation_junk(item):
+                continue
+            title = _clean_headline(item.get("title"))
+            if not title:
+                continue
+            results.append(
+                {
+                    "title": title,
+                    "summary": _clean_snippet(item.get("content")),
+                    "source_url": item.get("url"),
+                    "source_name": item.get("source"),
+                    "event_date": _parse_event_date(item),
+                    "raw_payload": item,
+                }
+            )
+        return results
+
 
 class NullSearchProvider:
     def search_stock_news(self, *, symbol: str, company_name: str | None, days: int = 30) -> list[dict[str, Any]]:
+        return []
+
+    def search_market_context(
+        self,
+        *,
+        query: str,
+        days: int = 30,
+        max_results: int = 8,
+        topic: str = "news",
+    ) -> list[dict[str, Any]]:
         return []
 
 
@@ -89,6 +150,13 @@ def _clean_headline(value: Any) -> str | None:
         return None
     headline = " ".join(str(value).split()).strip()
     return headline or None
+
+
+def _clean_snippet(value: Any) -> str | None:
+    if value is None:
+        return None
+    snippet = " ".join(str(value).split()).strip()
+    return snippet[:500] or None
 
 
 def _parse_event_date(item: dict[str, Any]) -> date | None:

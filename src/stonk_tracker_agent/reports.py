@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+import re
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -11,10 +12,8 @@ from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.platypus import Image as ReportLabImage
 from reportlab.platypus import Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
-
-from stonk_tracker_agent.analysis import candidate_watchlist_research_ideas, diversification_research_ideas
-
 
 DISCLAIMER = (
     "This report is for research and educational support only. It is not financial advice, investment advice, "
@@ -27,12 +26,16 @@ FINAL_NOTE = (
 )
 
 
+# Assemble the markdown report from already-curated research state; this layer
+# is intentionally about presentation rather than raw data collection.
 def render_markdown_report(
     *,
     stocks: list[Any],
     price_findings: dict[str, list[str]],
     events: dict[str, list[dict[str, Any]]],
     diversification: list[str],
+    diversification_ideas: list[dict[str, str]] | None = None,
+    watchlist_ideas: list[dict[str, str]] | None = None,
     holding_notes: dict[str, dict[str, Any]] | None = None,
     llm_summary: str | None,
     generated_at: datetime,
@@ -67,12 +70,14 @@ def render_markdown_report(
             "| --- | --- | --- |",
         ]
     )
-    for idea in diversification_research_ideas(stocks):
+    for idea in diversification_ideas or _fallback_diversification_ideas():
         lines.append(f"| {idea['area']} | {idea['examples']} | {idea['why']} |")
 
     lines.extend(["", "## Holding-by-Holding Research Notes", ""])
     if not stocks:
         lines.append("No active watchlist stocks found.")
+    # Each holding block renders the GPT-generated note when available and
+    # falls back to stored thesis data when it is not.
     for stock in stocks:
         symbol = _field(stock, "symbol")
         name = _field(stock, "company_name") or symbol
@@ -107,6 +112,8 @@ def render_markdown_report(
             lines.append(f"- {finding} This is a research flag, not a trade signal; review the related catalyst, liquidity, and whether fundamentals confirm the move.")
 
     lines.extend(["", "## Recent Events", ""])
+    # Event rendering stays intentionally terse because the detailed web-body
+    # text is noisy and not useful for the final report surface.
     for symbol, stock_events in events.items():
         lines.append(f"### {symbol}")
         if not stock_events:
@@ -122,7 +129,9 @@ def render_markdown_report(
 
     lines.extend(["", "## Diversification Research Ideas", ""])
     lines.append("Diversification comments identify areas to investigate, not assets to buy or allocations to implement.")
-    for idea in candidate_watchlist_research_ideas(stocks):
+    # Diversification comparison names now come from the graph's live-search
+    # research step, with a tiny placeholder only when that step is unavailable.
+    for idea in watchlist_ideas or _fallback_watchlist_ideas():
         lines.extend(["", f"### {idea['ticker']} - {idea['name']}", "", idea["angle"]])
 
     lines.extend(
@@ -157,6 +166,8 @@ def save_markdown_report(reports_dir: Path, title: str, content: str, generated_
     return path
 
 
+# PDF export is a second rendering pass over the saved markdown so the UI can
+# offer downloads without needing a browser-based print pipeline.
 def render_pdf_report(markdown_content: str, *, title: str = "Stonk Portfolio Research Report") -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -177,6 +188,8 @@ def render_pdf_report(markdown_content: str, *, title: str = "Stonk Portfolio Re
     code = ParagraphStyle("StonkCode", parent=styles["Code"], fontSize=7, leading=9)
     table_cell = ParagraphStyle("StonkTableCell", parent=body, fontSize=7, leading=9)
 
+    # Map simple markdown constructs into ReportLab flowables instead of trying
+    # to support the full markdown spec.
     story: list[Any] = []
     lines = markdown_content.splitlines()
     index = 0
@@ -195,6 +208,14 @@ def render_pdf_report(markdown_content: str, *, title: str = "Stonk Portfolio Re
             story.append(_markdown_table_to_pdf(table_lines, table_cell))
             story.append(Spacer(1, 8))
             continue
+        image_path = _markdown_image_path(line)
+        if image_path:
+            image = _markdown_image_to_pdf(image_path)
+            if image is not None:
+                story.append(image)
+                story.append(Spacer(1, 8))
+                index += 1
+                continue
         if line.startswith("# "):
             story.append(Paragraph(_inline_markdown_to_pdf(line[2:]), h1))
         elif line.startswith("## "):
@@ -256,6 +277,8 @@ def _markdown_table_to_pdf(table_lines: list[str], style: ParagraphStyle) -> Tab
     return table
 
 
+# Keep inline formatting support intentionally minimal: bold text is enough for
+# this report style and keeps PDF conversion predictable.
 def _inline_markdown_to_pdf(text: str) -> str:
     cleaned = escape(text).replace("`", "")
     parts = cleaned.split("**")
@@ -265,6 +288,26 @@ def _inline_markdown_to_pdf(text: str) -> str:
     for index, part in enumerate(parts[1:], start=1):
         rendered += f"<b>{part}</b>" if index % 2 == 1 else part
     return rendered
+
+
+def _markdown_image_path(line: str) -> str | None:
+    match = re.fullmatch(r"!\[[^\]]*\]\((.+)\)", line.strip())
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _markdown_image_to_pdf(path_text: str) -> ReportLabImage | None:
+    path = Path(path_text)
+    if not path.exists():
+        return None
+    image = ReportLabImage(str(path))
+    max_width = 7.2 * inch
+    max_height = 4.8 * inch
+    scale = min(max_width / image.imageWidth, max_height / image.imageHeight, 1)
+    image.drawWidth = image.imageWidth * scale
+    image.drawHeight = image.imageHeight * scale
+    return image
 
 
 def _fallback_executive_summary(*, stocks: list[Any], price_findings: dict[str, list[str]]) -> str:
@@ -295,11 +338,33 @@ def _should_render_event_summary(event: dict[str, Any]) -> bool:
     return source_name == "yahoo finance"
 
 
+# Join array-shaped LLM fields into report-friendly prose while preserving the
+# model's section structure.
 def _join_items(value: Any) -> str | None:
     if not isinstance(value, list):
         return None
     items = [" ".join(str(item).split()).strip() for item in value if str(item).strip()]
     return "; ".join(items) if items else None
+
+
+def _fallback_diversification_ideas() -> list[dict[str, str]]:
+    return [
+        {
+            "area": "Additional diversification research",
+            "examples": "Live web search unavailable",
+            "why": "Configure OpenAI and Tavily so the app can synthesize current diversification options from recent market context.",
+        }
+    ]
+
+
+def _fallback_watchlist_ideas() -> list[dict[str, str]]:
+    return [
+        {
+            "ticker": "TBD",
+            "name": "Live research candidate",
+            "angle": "Current watchlist comparison ideas were not generated from live search in this run. Configure OpenAI and Tavily to produce dynamic names and categories.",
+        }
+    ]
 
 
 def _cross_holding_risk_notes(stocks: list[Any]) -> list[str]:
