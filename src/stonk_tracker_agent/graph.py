@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
@@ -12,6 +11,13 @@ from stonk_tracker_agent.analysis import classify_event, detect_outliers, divers
 from stonk_tracker_agent.config import Settings, get_settings
 from stonk_tracker_agent.db.models import WatchlistStock
 from stonk_tracker_agent.db.repositories import ResearchRepository, WatchlistRepository
+from stonk_tracker_agent.llm_research import (
+    build_research_llm,
+    curate_events_with_llm,
+    generate_holding_note_with_llm,
+    interpret_outliers_with_llm,
+    synthesize_diversification_with_llm,
+)
 from stonk_tracker_agent.providers.market import MarketDataProvider, YFinanceMarketDataProvider
 from stonk_tracker_agent.providers.search import NullSearchProvider, SearchProvider, TavilySearchProvider
 from stonk_tracker_agent.reports import render_markdown_report, save_markdown_report
@@ -25,6 +31,7 @@ class ReportState(TypedDict, total=False):
     events: dict[str, list[dict[str, Any]]]
     price_findings: dict[str, list[str]]
     diversification: list[str]
+    holding_notes: dict[str, dict[str, Any]]
     llm_summary: str | None
     report_title: str
     report_path: str
@@ -41,6 +48,7 @@ def build_report_graph(
     settings = settings or get_settings()
     market_provider = market_provider or YFinanceMarketDataProvider()
     search_provider = search_provider or (TavilySearchProvider(settings.tavily_api_key) if settings.tavily_api_key else NullSearchProvider())
+    research_llm = build_research_llm(settings)
     research_repo = ResearchRepository(session)
     watchlist_repo = WatchlistRepository(session)
 
@@ -80,9 +88,14 @@ def build_report_graph(
         events: dict[str, list[dict[str, Any]]] = {}
         since = utc_now().date() - timedelta(days=30)
         saved_count = 0
+        curated_count = 0
         for stock in state.get("stocks", []):
             raw_events = search_provider.search_stock_news(symbol=stock["symbol"], company_name=stock.get("company_name"), days=30)
-            classified = [classify_event(event) for event in raw_events]
+            if research_llm:
+                classified = curate_events_with_llm(research_llm, stock=stock, raw_events=raw_events)
+            else:
+                classified = [classify_event(event) for event in raw_events]
+            curated_count += len(classified)
             orm_stock = stock_from_state(stock)
             for event in classified:
                 if orm_stock:
@@ -103,26 +116,63 @@ def build_report_graph(
                 ]
             else:
                 events[stock["symbol"]] = classified
-        return {**state, "events": events, "messages": [*state.get("messages", []), f"Captured {saved_count} event candidates and loaded 30-day event history."]}
+        llm_note = " with GPT curation" if research_llm else ""
+        return {
+            **state,
+            "events": events,
+            "messages": [
+                *state.get("messages", []),
+                f"Captured {saved_count} event rows{llm_note}; {curated_count} kept after filtering and loaded 30-day event history.",
+            ],
+        }
 
     def analyze(state: ReportState) -> ReportState:
-        price_findings = {}
+        price_findings: dict[str, list[str]] = {}
+        holding_notes: dict[str, dict[str, Any]] = {}
         for stock in state.get("stocks", []):
-            price_findings[stock["symbol"]] = detect_outliers(stock["symbol"], research_repo.recent_snapshots(stock["id"]))
-        diversification = diversification_notes(state.get("stocks", []))
+            snapshots = research_repo.recent_snapshots(stock["id"])
+            heuristic_findings = detect_outliers(stock["symbol"], snapshots)
+            stock_events = state.get("events", {}).get(stock["symbol"], [])
+            interpreted_findings = interpret_outliers_with_llm(
+                research_llm,
+                stock=stock,
+                snapshots=snapshots,
+                events=stock_events,
+                heuristic_findings=heuristic_findings,
+            )
+            price_findings[stock["symbol"]] = interpreted_findings
+            holding_notes[stock["symbol"]] = generate_holding_note_with_llm(
+                research_llm,
+                stock=stock,
+                snapshots=snapshots,
+                events=stock_events,
+                outlier_notes=interpreted_findings,
+            )
+        diversification = (
+            synthesize_diversification_with_llm(
+                research_llm,
+                stocks=state.get("stocks", []),
+                events_by_symbol=state.get("events", {}),
+            )
+            if research_llm
+            else diversification_notes(state.get("stocks", []))
+        )
         return {
             **state,
             "price_findings": price_findings,
             "diversification": diversification,
-            "messages": [*state.get("messages", []), "Analyzed outliers and diversification."],
+            "holding_notes": holding_notes,
+            "messages": [
+                *state.get("messages", []),
+                "Generated GPT research notes for outliers, holdings, and diversification." if research_llm else "Analyzed outliers and diversification.",
+            ],
         }
 
     def summarize(state: ReportState) -> ReportState:
         if not state.get("stocks"):
             return {**state, "llm_summary": None, "messages": [*state.get("messages", []), "Skipped LLM summary; watchlist is empty."]}
-        if not settings.openai_api_key:
+        if research_llm is None:
             return {**state, "llm_summary": None, "messages": [*state.get("messages", []), "Skipped LLM summary; OPENAI_API_KEY is not set."]}
-        llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0.2)
         prompt = (
             "You are a portfolio research and diversification assistant. "
             "Analyze the watchlist and write only the Executive Summary section for a larger report. "
@@ -134,9 +184,10 @@ def build_report_graph(
             f"Stocks: {[stock['symbol'] for stock in state.get('stocks', [])]}\n"
             f"Outliers: {state.get('price_findings', {})}\n"
             f"Diversification: {state.get('diversification', [])}\n"
-            f"Events: {state.get('events', {})}"
+            f"Events: {state.get('events', {})}\n"
+            f"Holding notes: {state.get('holding_notes', {})}"
         )
-        response = llm.invoke(prompt)
+        response = research_llm.invoke(prompt)
         return {**state, "llm_summary": response.content, "messages": [*state.get("messages", []), "Generated LLM summary."]}
 
     def persist_report(state: ReportState) -> ReportState:
@@ -146,6 +197,7 @@ def build_report_graph(
             price_findings=state.get("price_findings", {}),
             events=state.get("events", {}),
             diversification=state.get("diversification", []),
+            holding_notes=state.get("holding_notes", {}),
             llm_summary=state.get("llm_summary"),
             generated_at=finished_at,
         )

@@ -39,7 +39,7 @@ class FakeSearchProvider:
             {
                 "event_date": date(2026, 5, 1),
                 "title": "Microsoft cloud growth improves",
-                "summary": "Azure demand supports long-term cloud thesis.",
+                "summary": None,
                 "source_url": "https://example.com/msft-cloud",
                 "source_name": "Example",
             }

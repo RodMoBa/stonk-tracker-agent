@@ -5,6 +5,33 @@ from typing import Any, Protocol
 
 import requests
 
+NAVIGATION_JUNK_PHRASES = {
+    "skip navigation",
+    "watch now",
+    "pre-markets",
+    "u.s. markets",
+    "europe markets",
+    "asia markets",
+    "world markets",
+    "currencies",
+    "prediction markets",
+    "cryptocurrency",
+    "futures & commodities",
+    "funds & etfs",
+    "white house policy",
+    "squawk box",
+}
+
+GENERIC_NAV_HEADLINES = {
+    "markets",
+    "business",
+    "investing",
+    "tech",
+    "politics",
+    "video",
+    "share",
+}
+
 
 class SearchProvider(Protocol):
     def search_stock_news(self, *, symbol: str, company_name: str | None, days: int = 7) -> list[dict[str, Any]]:
@@ -23,7 +50,7 @@ class TavilySearchProvider:
         query_name = company_name or symbol
         payload = {
             "api_key": self.api_key,
-            "query": f"{query_name} {symbol} stock news catalyst last {days} days",
+            "query": f"{query_name} {symbol} stock news headlines catalysts last {days} days",
             "search_depth": "advanced",
             "topic": "news",
             "days": days,
@@ -35,12 +62,14 @@ class TavilySearchProvider:
         data = response.json()
         events = []
         for item in data.get("results", []):
+            if _looks_like_navigation_junk(item):
+                continue
             if not _is_relevant_result(item, symbol=symbol, company_name=company_name):
                 continue
             events.append(
                 {
-                    "title": item.get("title"),
-                    "summary": item.get("content"),
+                    "title": _clean_headline(item.get("title")) or "Untitled event",
+                    "summary": None,
                     "source_url": item.get("url"),
                     "source_name": item.get("source"),
                     "event_date": _parse_event_date(item) or date.today(),
@@ -53,6 +82,13 @@ class TavilySearchProvider:
 class NullSearchProvider:
     def search_stock_news(self, *, symbol: str, company_name: str | None, days: int = 30) -> list[dict[str, Any]]:
         return []
+
+
+def _clean_headline(value: Any) -> str | None:
+    if value is None:
+        return None
+    headline = " ".join(str(value).split()).strip()
+    return headline or None
 
 
 def _parse_event_date(item: dict[str, Any]) -> date | None:
@@ -72,14 +108,27 @@ def _parse_event_date(item: dict[str, Any]) -> date | None:
 
 
 def _is_relevant_result(item: dict[str, Any], *, symbol: str, company_name: str | None) -> bool:
-    text = " ".join(
+    title_text = " ".join(
         str(value or "")
         for value in (
             item.get("title"),
-            item.get("url"),
         )
     ).lower()
-    if symbol.lower() in text:
+    if symbol.lower() in title_text:
         return True
     company_tokens = [token.lower() for token in (company_name or "").replace(",", " ").split() if len(token) > 2]
-    return any(token in text for token in company_tokens)
+    return any(token in title_text for token in company_tokens)
+
+
+def _looks_like_navigation_junk(item: dict[str, Any]) -> bool:
+    title = _clean_headline(item.get("title")) or ""
+    title_text = title.lower()
+    content_text = " ".join(str(item.get("content") or "").split()).lower()
+    if title_text in GENERIC_NAV_HEADLINES:
+        return True
+    combined = f"{title_text} {content_text}".strip()
+    if any(phrase in combined for phrase in NAVIGATION_JUNK_PHRASES):
+        return True
+    if len(content_text) > 250 and sum(1 for phrase in NAVIGATION_JUNK_PHRASES if phrase in content_text) >= 2:
+        return True
+    return False

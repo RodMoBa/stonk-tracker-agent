@@ -122,13 +122,21 @@ def generate_long_term_thesis(
     if not settings.openai_api_key:
         return fallback
     llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0.2)
+    event_headers = [
+        {
+            "event_date": event.get("event_date"),
+            "title": event.get("title"),
+            "source_name": event.get("source_name"),
+        }
+        for event in events[:10]
+    ]
     prompt = (
         "Generate a concise long-term investment research thesis for a stock watchlist. "
-        "Use evidence only from the profile and news events below. "
+        "Use evidence only from the profile and news event headers below. "
         "Do not give direct buy/sell instructions. Include durable strengths, risks, and what to monitor.\n\n"
         f"Symbol: {symbol}\n"
         f"Profile: {profile}\n"
-        f"Recent events: {events[:10]}\n"
+        f"Recent event headers: {event_headers}\n"
         f"User notes: {manual_notes or ''}"
     )
     try:
